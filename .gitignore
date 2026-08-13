@@ -1,0 +1,12 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Never commit keystores — they contain (encrypted) wallet secrets
+wallets.json
+*.wallets.json
+wallets.json.tmp
+
+# macOS
+.DS_Store
