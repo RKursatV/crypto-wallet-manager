@@ -29,21 +29,29 @@ wm import old-wallet           # import an existing recovery phrase
 wm import mm --eth-private-key # import a raw ETH private key
 wm export savings              # reveal the recovery phrase (guarded)
 wm export savings --eth-key    # reveal derived ETH private key (guarded)
-wm delete old-wallet           # remove a wallet (typed confirmation)
+wm delete old-wallet           # remove a wallet (password + typed confirmation)
 wm change-password             # re-encrypt keystore with a new password
+wm verify                      # prove stored addresses match their secrets
 ```
 
 The first `create`/`import` asks you to set a master password for the
-keystore. Every command that touches secret material asks for it again;
-`list`, `show`, and `balance` never need it.
+keystore. Every command that touches or destroys secret material asks for
+it again; `list`, `show`, and `balance` never need it.
 
 ## Where things live
 
 The keystore is a single JSON file (default
 `~/.crypto-wallet-manager/wallets.json`, permissions `0600`). Wallet names
 and public addresses are plaintext; recovery phrases / private keys are
-encrypted with Fernet (AES-128-CBC + HMAC-SHA256) under a key derived from
-your master password with scrypt (n=32768, r=8, p=1).
+encrypted with Fernet (AES-128-CBC + HMAC-SHA256). scrypt (n=32768, r=8,
+p=1) stretches your master password into 64 bytes: half becomes the Fernet
+key, half an HMAC key that seals the plaintext metadata.
+
+That seal means anyone who edits the file to swap your deposit addresses
+for theirs is caught the next time you enter your password. `list` and
+`balance` skip the password, so they can't check the seal — if a keystore
+file has been somewhere you don't trust, run `verify`, which additionally
+re-derives every address from its decrypted secret.
 
 Override the location with `--file <path>` or `$WALLET_MANAGER_FILE`.
 

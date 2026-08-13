@@ -16,10 +16,13 @@ This tool intentionally does NOT sign or send transactions.
 import argparse
 import base64
 import getpass
+import hashlib
+import hmac
 import json
 import os
 import secrets as pysecrets
 import sys
+from collections import namedtuple
 from datetime import datetime, timezone
 
 try:
@@ -47,7 +50,7 @@ except ImportError as exc:
 DEFAULT_STORE = os.path.join(
     os.path.expanduser("~"), ".crypto-wallet-manager", "wallets.json"
 )
-STORE_VERSION = 1
+STORE_VERSION = 2
 CHECK_PLAINTEXT = b"crypto-wallet-manager-check-v1"
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**15, 8, 1
 
@@ -84,10 +87,10 @@ def save_store(path, store):
     if directory:
         os.makedirs(directory, mode=0o700, exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(store, fh, indent=2)
         fh.write("\n")
-    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -103,54 +106,88 @@ def new_store():
             "p": SCRYPT_P,
         },
         "check": None,  # filled in once the master password is set
+        "pubmac": None,  # HMAC sealing the plaintext wallet metadata
         "wallets": [],
     }
 
 
-def derive_fernet(store, password):
+Keys = namedtuple("Keys", ["fernet", "mac"])
+
+
+def derive_keys(store, password):
     kdf_meta = store["kdf"]
     kdf = Scrypt(
         salt=base64.b64decode(kdf_meta["salt"]),
-        length=32,
+        length=64,
         n=kdf_meta["n"],
         r=kdf_meta["r"],
         p=kdf_meta["p"],
     )
     key = kdf.derive(password.encode())
-    return Fernet(base64.urlsafe_b64encode(key))
+    return Keys(Fernet(base64.urlsafe_b64encode(key[:32])), key[32:])
+
+
+def public_fingerprint(store):
+    public = [
+        {k: w.get(k) for k in ("name", "type", "created_at",
+                               "eth_address", "btc_address")}
+        for w in store["wallets"]
+    ]
+    return json.dumps(public, sort_keys=True, separators=(",", ":")).encode()
+
+
+def compute_pubmac(store, mac_key):
+    return hmac.new(mac_key, public_fingerprint(store), hashlib.sha256).hexdigest()
+
+
+def seal_store(store, keys):
+    """Seal names/addresses so file tampering is detected at next unlock."""
+    store["pubmac"] = compute_pubmac(store, keys.mac)
 
 
 def get_password(prompt="Master password: ", confirm=False):
     env = os.environ.get("WALLET_MANAGER_PASSWORD")
     if env is not None:
+        if not env:
+            sys.exit("WALLET_MANAGER_PASSWORD is set but empty; refusing.")
         return env
     pw = getpass.getpass(prompt)
-    if confirm:
-        again = getpass.getpass("Confirm password: ")
-        if pw != again:
-            sys.exit("Passwords do not match.")
     if not pw:
         sys.exit("Empty password not allowed.")
+    if confirm:
+        if pw != getpass.getpass("Confirm password: "):
+            sys.exit("Passwords do not match.")
+        if len(pw) < 8:
+            print("WARNING: short master password. Anyone who copies the")
+            print("keystore file can brute-force it offline; use a longer one.")
     return pw
 
 
 def unlock(store, create_if_new=False):
-    """Return a Fernet for the store, verifying (or setting) the password."""
+    """Return Keys for the store, verifying (or setting) the password."""
     if store["check"] is None:
         if not create_if_new:
             sys.exit("Keystore has no password set yet; create a wallet first.")
         print("Setting master password for a new keystore.")
-        pw = get_password("New master password: ", confirm=True)
-        fernet = derive_fernet(store, pw)
-        store["check"] = fernet.encrypt(CHECK_PLAINTEXT).decode()
-        return fernet
-    fernet = derive_fernet(store, get_password())
+        keys = derive_keys(store, get_password("New master password: ", confirm=True))
+        store["check"] = keys.fernet.encrypt(CHECK_PLAINTEXT).decode()
+        return keys
+    keys = derive_keys(store, get_password())
     try:
-        if fernet.decrypt(store["check"].encode()) != CHECK_PLAINTEXT:
+        if keys.fernet.decrypt(store["check"].encode()) != CHECK_PLAINTEXT:
             raise InvalidToken
     except InvalidToken:
         sys.exit("Wrong master password.")
-    return fernet
+    if store.get("pubmac") and not hmac.compare_digest(
+        compute_pubmac(store, keys.mac), store["pubmac"]
+    ):
+        sys.exit(
+            "TAMPER WARNING: wallet names/addresses in the keystore do not\n"
+            "match the values sealed at the last save. Someone may have edited\n"
+            "the file to swap in their own addresses. Do not send funds to any\n"
+            "address it shows; restore the keystore from a trusted backup."
+        )
+    return keys
 
 
 def find_wallet(store, name):
@@ -250,28 +287,34 @@ def cmd_create(args):
     store = load_store(path) or new_store()
     if any(w["name"] == args.name for w in store["wallets"]):
         sys.exit(f"A wallet named {args.name!r} already exists.")
-    fernet = unlock(store, create_if_new=True)
+    keys = unlock(store, create_if_new=True)
 
     mnemonic = str(Bip39MnemonicGenerator().FromWordsNumber(WORDS_TO_ENUM[args.words]))
     wallet = {
         "name": args.name,
         "type": "mnemonic",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "secret": fernet.encrypt(mnemonic.encode()).decode(),
+        "secret": keys.fernet.encrypt(mnemonic.encode()).decode(),
         **derive_addresses(mnemonic),
     }
     store["wallets"].append(wallet)
+    seal_store(store, keys)
     save_store(path, store)
 
     print(f"Created wallet {args.name!r} ({args.words} words).")
     print_wallet(wallet)
     print()
-    print("Recovery phrase (write it down on paper, then clear your terminal):")
-    print(f"  {mnemonic}")
-    print()
-    print("WARNING: anyone with this phrase controls the funds. It is stored")
-    print(f"encrypted in {path}, but the paper backup is what saves you if")
-    print("this machine dies. Never store it in a screenshot or cloud note.")
+    if sys.stdout.isatty():
+        print("Recovery phrase (write it down on paper, then clear your terminal):")
+        print(f"  {mnemonic}")
+        print()
+        print("WARNING: anyone with this phrase controls the funds. It is stored")
+        print(f"encrypted in {path}, but the paper backup is what saves you if")
+        print("this machine dies. Never store it in a screenshot or cloud note.")
+    else:
+        print("stdout is not a terminal, so the recovery phrase was NOT printed")
+        print("(it would have been captured by the file or pipe receiving this")
+        print("output). Run 'export' in an interactive terminal to back it up.")
 
 
 def cmd_import(args):
@@ -279,7 +322,7 @@ def cmd_import(args):
     store = load_store(path) or new_store()
     if any(w["name"] == args.name for w in store["wallets"]):
         sys.exit(f"A wallet named {args.name!r} already exists.")
-    fernet = unlock(store, create_if_new=True)
+    keys = unlock(store, create_if_new=True)
 
     if args.eth_private_key:
         key_hex = read_secret_line("ETH private key (hex, input hidden): ")
@@ -291,7 +334,7 @@ def cmd_import(args):
             "name": args.name,
             "type": "eth_private_key",
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "secret": fernet.encrypt(key_hex.encode()).decode(),
+            "secret": keys.fernet.encrypt(key_hex.encode()).decode(),
             "eth_address": address,
         }
     else:
@@ -302,11 +345,12 @@ def cmd_import(args):
             "name": args.name,
             "type": "mnemonic",
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "secret": fernet.encrypt(mnemonic.encode()).decode(),
+            "secret": keys.fernet.encrypt(mnemonic.encode()).decode(),
             **derive_addresses(mnemonic),
         }
 
     store["wallets"].append(wallet)
+    seal_store(store, keys)
     save_store(path, store)
     print(f"Imported wallet {args.name!r}.")
     print_wallet(wallet)
@@ -356,13 +400,13 @@ def cmd_export(args):
     if not store:
         sys.exit("No keystore found.")
     wallet = find_wallet(store, args.name)
-    fernet = unlock(store)
+    keys = unlock(store)
 
     print("You are about to display secret key material on screen.")
     if input("Type 'reveal' to continue: ").strip() != "reveal":
         sys.exit("Aborted.")
 
-    secret = fernet.decrypt(wallet["secret"].encode()).decode()
+    secret = keys.fernet.decrypt(wallet["secret"].encode()).decode()
     if wallet["type"] == "mnemonic":
         if args.eth_key:
             print(f"ETH private key ({ETH_PATH}):")
@@ -382,11 +426,13 @@ def cmd_delete(args):
     if not store:
         sys.exit("No keystore found.")
     wallet = find_wallet(store, args.name)
+    keys = unlock(store)
     print(f"Deleting {wallet['name']!r} removes its encrypted secret from this")
     print("machine. Without a backup of the recovery phrase, funds are LOST.")
     if input(f"Type the wallet name ({args.name}) to confirm: ").strip() != args.name:
         sys.exit("Aborted.")
     store["wallets"].remove(wallet)
+    seal_store(store, keys)
     save_store(path, store)
     print(f"Deleted wallet {args.name!r}.")
 
@@ -396,9 +442,9 @@ def cmd_change_password(args):
     store = load_store(path)
     if not store or store["check"] is None:
         sys.exit("No keystore found.")
-    old_fernet = unlock(store)
+    old_keys = unlock(store)
     secrets_plain = [
-        old_fernet.decrypt(w["secret"].encode()) for w in store["wallets"]
+        old_keys.fernet.decrypt(w["secret"].encode()) for w in store["wallets"]
     ]
 
     new_pw = os.environ.get("WALLET_MANAGER_NEW_PASSWORD")
@@ -410,12 +456,45 @@ def cmd_change_password(args):
         sys.exit("Empty password not allowed.")
 
     store["kdf"]["salt"] = base64.b64encode(pysecrets.token_bytes(16)).decode()
-    new_fernet = derive_fernet(store, new_pw)
-    store["check"] = new_fernet.encrypt(CHECK_PLAINTEXT).decode()
+    new_keys = derive_keys(store, new_pw)
+    store["check"] = new_keys.fernet.encrypt(CHECK_PLAINTEXT).decode()
     for wallet, plain in zip(store["wallets"], secrets_plain):
-        wallet["secret"] = new_fernet.encrypt(plain).decode()
+        wallet["secret"] = new_keys.fernet.encrypt(plain).decode()
+    seal_store(store, new_keys)
     save_store(path, store)
     print("Master password changed; all secrets re-encrypted.")
+
+
+def cmd_verify(args):
+    path = store_path(args)
+    store = load_store(path)
+    if not store or store["check"] is None:
+        sys.exit("No keystore found.")
+    keys = unlock(store)  # also checks the metadata seal, if present
+
+    failures = 0
+    for wallet in store["wallets"]:
+        secret = keys.fernet.decrypt(wallet["secret"].encode()).decode()
+        if wallet["type"] == "mnemonic":
+            derived = derive_addresses(secret)
+        else:
+            derived = {"eth_address": eth_address_from_private_key(secret)}
+        bad = [coin for coin, addr in derived.items() if wallet.get(coin) != addr]
+        if bad:
+            failures += 1
+            print(f"  {wallet['name']}: MISMATCH on {', '.join(bad)} — the "
+                  "stored address does NOT belong to this wallet's secret!")
+        else:
+            print(f"  {wallet['name']}: OK")
+
+    if failures:
+        sys.exit(f"{failures} wallet(s) failed verification. Do not send funds "
+                 "to the addresses this keystore shows.")
+    if not store.get("pubmac"):
+        seal_store(store, keys)
+        save_store(path, store)
+        print("Keystore upgraded: metadata is now sealed against tampering.")
+    print("All wallets verified: stored addresses match their secrets.")
 
 
 # ---------------------------------------------------------------- main
@@ -464,6 +543,10 @@ def main():
 
     p = sub.add_parser("change-password", help="re-encrypt the keystore with a new password")
     p.set_defaults(func=cmd_change_password)
+
+    p = sub.add_parser("verify",
+                       help="check stored addresses against decrypted secrets")
+    p.set_defaults(func=cmd_verify)
 
     args = parser.parse_args()
     args.func(args)
