@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- PyPI publishing workflow (Trusted Publishing, runs on GitHub release).
+- Project URLs in the package metadata.
+
 ## [0.1.0] - 2026-09-15
 
 First public release.
