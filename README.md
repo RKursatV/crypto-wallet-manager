@@ -12,9 +12,9 @@ watches balances only.
 Requires Python 3.10+.
 
 ```sh
-pipx install .            # isolated install, puts `wallet-manager` on PATH
-# or
-pip install .
+pipx install crypto-wallet-manager    # from PyPI; puts `wallet-manager` on PATH
+# or, from a checkout:
+pipx install .
 ```
 
 For development, or to run it without installing:
