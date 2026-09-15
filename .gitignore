@@ -10,3 +10,10 @@ wallets.json.tmp
 
 # macOS
 .DS_Store
+
+# Packaging / tooling
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
